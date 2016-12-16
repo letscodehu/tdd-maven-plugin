@@ -6,10 +6,7 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 import static java.nio.file.StandardWatchEventKinds.OVERFLOW;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.net.MalformedURLException;
-import java.net.URL;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
@@ -28,7 +25,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -56,7 +52,7 @@ import fr.jcgay.notification.Notifier;
 import fr.jcgay.notification.SendNotification;
 
 /**
- * Utility for watching directories/files and triggering a maven goal.
+ * Utility for watching directories/files and triggering a maven test goal against the modified files.
  *
  * @author tacsiazuma
  */
@@ -71,6 +67,12 @@ public class RunMojo extends AbstractMojo {
 
     @Parameter(property = "profiles", alias = "watcher.profiles", required = false)
     protected List<String> profiles;
+
+    /**
+     * The number of runs before a regression test (whole module) will be run to catch possible regression errors.
+     */
+    @Parameter(property = "regression", alias = "watcher.regression", required = false)
+    protected Integer regression;
 
     @Component
     protected PluginPrefixResolver pluginPrefixResolver;
@@ -87,26 +89,105 @@ public class RunMojo extends AbstractMojo {
     private Map<Path, WatchFileSet> configMap;
     private Map<Path, WatchKey> pathMap;
     private Map<WatchKey, Path> watchKeyMap;
+    private Icon successIcon;
+    private Icon failIcon;
+    private Application app;
+    private Notifier notifier;
+
+    private long longTimeout = 60 * 60 * 24 * 1000L;
+    private long shortTimeout = 750L;
+    private long timeout = longTimeout;
+    private int secondsDueToRunGoal = 0;
 
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
     	executionProperties = session.getUserProperties();
-    	  
-    	Icon successIcon = null;
-		successIcon = Icon.create(RunMojo.class.getClassLoader().getResource("success.png"), "letuscodelikegentleman");
-		Icon failIcon = null;
-		failIcon = Icon.create(RunMojo.class.getClassLoader().getResource("fail.png"), "letuscodelikegentleman");
-    	Application app = null;
-		app = Application.builder("application/hu.letscode.tdd", "Maven TDD plugin", successIcon ).build();
-        Notifier notifier = new SendNotification()
-                .setApplication(app)
-                .initNotifier();
-    	
-    	
+
+        initializeIcons();
+
         this.configMap = new HashMap<>();
         this.pathMap = new HashMap<>();
         this.watchKeyMap = new HashMap<>();
 
+        registeringWatches();
+
+        startWatching();
+    }
+
+    private void startWatching() {
+        while (true) {
+            try {
+
+                if (timeout > shortTimeout) {
+                    getLog().info("Watcher - waiting for changes...");
+                }
+
+                // timeout to poll for (this way we can let lots of quick changes
+                // take place -- and only run the goal when things settles down)
+                WatchKey watchKey = watchService.poll(timeout, TimeUnit.MILLISECONDS);
+                if (watchKey == null) {
+                    // timeout occurred!
+                    if (secondsDueToRunGoal > 0) {
+                        executeTests();
+                    }
+
+                    timeout = longTimeout;
+                    secondsDueToRunGoal = 0;
+                    continue;
+                }
+
+                // schedule the goal to run
+                timeout = shortTimeout;
+                secondsDueToRunGoal++;
+
+                pollForEvents(watchKey);
+
+            } catch (InterruptedException | ClosedWatchServiceException e) {
+                break;
+            }
+        }
+    }
+
+    private void executeTests() {
+        MavenExecutionRequest request = DefaultMavenExecutionRequest.copy(session.getRequest());
+
+        if (this.profiles != null && this.profiles.size() > 0) {
+            request.setActiveProfiles(profiles);
+        }
+        request.setUserProperties(executionProperties);
+        request.setGoals(Arrays.asList("compile", "test"));
+
+        if (!executionProperties.isEmpty()) {
+            MavenExecutionResult executionResult = maven.execute(request);
+            executionProperties = new Properties();
+            if (executionResult.hasExceptions()) {
+                try {
+                    notifier.send(Notification.builder("Tests failed!", "You could do better!", failIcon).build());
+                } finally {
+                    notifier.close();
+                }
+
+            } else {
+                try {
+                    notifier.send(Notification.builder("Tests passed!", "Good job!", successIcon).build());
+                } finally {
+                    notifier.close();
+                }
+            }
+        }
+    }
+
+    private void pollForEvents(WatchKey watchKey) {
+        Path watchPath = watchKeyMap.get(watchKey);
+
+        List<WatchEvent<?>> pollEvents = watchKey.pollEvents(); // take events, but don't care what they are!
+        for (@SuppressWarnings("rawtypes") WatchEvent event : pollEvents) {
+            secondsDueToRunGoal = analyzeEvents(secondsDueToRunGoal, watchPath, event);
+        }
+        watchKey.reset();
+    }
+
+    private void registeringWatches() throws MojoExecutionException, MojoFailureException {
         try {
             watchService = FileSystems.getDefault().newWatchService();
         } catch (Exception e) {
@@ -114,81 +195,22 @@ public class RunMojo extends AbstractMojo {
         }
 
         getLog().info("Registering " + watches.size() + " watch sets...");
-        
+
         for (WatchFileSet wfs : watches) {
             registerWatchSet(wfs);
         }
-
-        long longTimeout = 60 * 60 * 24 * 1000L;
-        long shortTimeout = 750L;
-        long timeout = longTimeout;
-        int dueToRunGoal = 0;
-        
-        while (true) {
-            try {
-                
-                if (timeout > shortTimeout) {
-                    getLog().info("Watcher - waiting for changes...");
-                }
-                
-                // timeout to poll for (this way we can let lots of quick changes
-                // take place -- and only run the goal when things settles down)
-                WatchKey watchKey = watchService.poll(timeout, TimeUnit.MILLISECONDS);
-                if (watchKey == null) {
-                    // timeout occurred!
-                    if (dueToRunGoal > 0) {
-                        MavenExecutionRequest request = DefaultMavenExecutionRequest.copy(session.getRequest());
-                        
-                        if (this.profiles != null && this.profiles.size() > 0) {
-                            request.setActiveProfiles(profiles);
-                        }
-                        request.setUserProperties(executionProperties);
-                        request.setGoals(Arrays.asList("compile", "test"));
-                        
-                        if (!executionProperties.isEmpty()) {
-                            MavenExecutionResult executionResult = maven.execute(request);
-                            executionProperties = new Properties();
-                            if (executionResult.hasExceptions()) {
-                                try {
-                                	notifier.send(Notification.builder("Tests failed!", "You could do better!", failIcon).build());	
-                                } finally {
-                                	notifier.close();
-                                }
-                                
-                            } else {
-                            	try {
-                                	notifier.send(Notification.builder("Tests passed!", "Good job!", successIcon).build());	
-                                } finally {
-                                	notifier.close();
-                                }
-                            }
-                        }
-                    }
-                    
-                    timeout = longTimeout;
-                    dueToRunGoal = 0;
-                    continue;
-                }
-                
-                // schedule the goal to run
-                timeout = shortTimeout;
-                dueToRunGoal++;
-                
-                Path watchPath = watchKeyMap.get(watchKey);
-
-                List<WatchEvent<?>> pollEvents = watchKey.pollEvents(); // take events, but don't care what they are!
-                for (@SuppressWarnings("rawtypes") WatchEvent event : pollEvents) {
-                    dueToRunGoal = analyzeEvents(dueToRunGoal, watchPath, event);
-                }
-
-                watchKey.reset();
-            } catch (InterruptedException | ClosedWatchServiceException e) {
-                break;
-            }
-        }
     }
 
-	private int analyzeEvents(int dueToRunGoal, Path watchPath, WatchEvent event) {
+    private void initializeIcons() {
+        successIcon = Icon.create(RunMojo.class.getClassLoader().getResource("success.png"), "letuscodelikegentleman");
+        failIcon = Icon.create(RunMojo.class.getClassLoader().getResource("fail.png"), "letuscodelikegentleman");
+        app = Application.builder("application/hu.letscode.tdd", "Maven TDD plugin", successIcon).build();
+        notifier = new SendNotification()
+                .setApplication(app)
+                .initNotifier();
+    }
+
+    private int analyzeEvents(int dueToRunGoal, Path watchPath, WatchEvent event) {
 		if (event.context() instanceof Path) {
 		    // event is always relative to what was watched (e.g. testdir)
 		    Path eventPath = (Path) event.context();
